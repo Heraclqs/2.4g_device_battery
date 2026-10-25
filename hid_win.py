@@ -22,7 +22,7 @@ OPEN_EXISTING = 3
 FILE_FLAG_OVERLAPPED = 0x40000000
 ERROR_IO_PENDING = 997
 WAIT_OBJECT_0 = 0
-INVALID_HANDLE = wintypes.HANDLE(-1).value
+INVALID_HANDLE = ctypes.c_void_p(-1).value
 
 
 class GUID(ctypes.Structure):
@@ -94,7 +94,7 @@ kernel32.ReadFile.argtypes = [
 ]
 kernel32.WriteFile.argtypes = [
     wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(OVERLAPPED),
 ]
 kernel32.CreateEventW.restype = wintypes.HANDLE
 kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
@@ -136,7 +136,22 @@ def _hid_guid() -> GUID:
 
 def _device_paths() -> list[str]:
     guid = _hid_guid()
+    setupapi.SetupDiGetClassDevsW.argtypes = [
+        ctypes.POINTER(GUID), wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD,
+    ]
     setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
+    setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(GUID),
+        wintypes.DWORD, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+    ]
+    setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
+    setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA), ctypes.c_void_p,
+        wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+    setupapi.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+    setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
     handle = setupapi.SetupDiGetClassDevsW(ctypes.byref(guid), None, None, 0x12)
     if not handle or handle == INVALID_HANDLE:
         return []
@@ -217,21 +232,26 @@ def enumerate_hid() -> list[HidDevice]:
 
 
 class HidIo:
-    """One overlapped reader and one synchronous writer."""
+    """Overlapped reader and writer. A write that the device never accepts is cancelled."""
 
     def __init__(self, path: str, in_len: int):
         self.in_len = in_len
         self.event = None
+        self.write_event = None
         self.ov = OVERLAPPED()
+        self.write_ov = OVERLAPPED()
         self.reader = _open(path, GENERIC_READ, overlapped=True)
-        self.writer = _open(path, GENERIC_WRITE)
+        self.writer = _open(path, GENERIC_WRITE, overlapped=True)
         if self.reader is None or self.writer is None:
             self.close()
             err = ctypes.get_last_error()
             raise OSError(err, "打不开 HID 配置口")
         self.event = kernel32.CreateEventW(None, True, False, None)
+        self.write_event = kernel32.CreateEventW(None, True, False, None)
         self.ov = OVERLAPPED()
         self.ov.hEvent = self.event
+        self.write_ov = OVERLAPPED()
+        self.write_ov.hEvent = self.write_event
         self.buf = ctypes.create_string_buffer(in_len)
         self.got = wintypes.DWORD()
         self._sync: bytes | None = None
@@ -249,11 +269,19 @@ class HidIo:
         if err != ERROR_IO_PENDING:
             raise OSError(err, "ReadFile")
 
-    def write(self, report: bytes) -> None:
+    def write(self, report: bytes, timeout_ms: int = 200) -> None:
         payload = ctypes.create_string_buffer(report, len(report))
         written = wintypes.DWORD()
-        if not kernel32.WriteFile(self.writer, payload, len(report), ctypes.byref(written), None):
+        kernel32.ResetEvent(self.write_event)
+        ok = kernel32.WriteFile(self.writer, payload, len(report), ctypes.byref(written), ctypes.byref(self.write_ov))
+        if not ok and ctypes.get_last_error() != ERROR_IO_PENDING:
             raise OSError(ctypes.get_last_error(), "WriteFile")
+        if kernel32.WaitForSingleObject(self.write_event, timeout_ms) != WAIT_OBJECT_0:
+            kernel32.CancelIoEx(self.writer, ctypes.byref(self.write_ov))
+            kernel32.WaitForSingleObject(self.write_event, 100)
+            raise OSError(0, "写入超时")
+        if not kernel32.GetOverlappedResult(self.writer, ctypes.byref(self.write_ov), ctypes.byref(written), False):
+            raise OSError(ctypes.get_last_error(), "GetOverlappedResult")
         if written.value != len(report):
             raise OSError(0, f"只写了 {written.value} 字节")
 
@@ -271,14 +299,20 @@ class HidIo:
         return data
 
     def close(self) -> None:
-        if getattr(self, "reader", None):
+        if getattr(self, "reader", None) and getattr(self, "event", None):
             kernel32.CancelIoEx(self.reader, ctypes.byref(self.ov))
-            if getattr(self, "event", None):
-                kernel32.WaitForSingleObject(self.event, 200)
-        for handle in (getattr(self, "event", None), getattr(self, "reader", None), getattr(self, "writer", None)):
+            kernel32.WaitForSingleObject(self.event, 200)
+        if getattr(self, "writer", None) and getattr(self, "write_event", None):
+            kernel32.CancelIoEx(self.writer, ctypes.byref(self.write_ov))
+            kernel32.WaitForSingleObject(self.write_event, 100)
+        for handle in (
+            getattr(self, "event", None), getattr(self, "write_event", None),
+            getattr(self, "reader", None), getattr(self, "writer", None),
+        ):
             if handle:
                 kernel32.CloseHandle(handle)
         self.event = None
+        self.write_event = None
         self.reader = None
         self.writer = None
 

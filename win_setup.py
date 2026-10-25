@@ -129,25 +129,48 @@ def launcher_path() -> Path:
     return ROOT / "start_tray.pyw"
 
 
+DEFAULT_CONFIG = {
+    "interval": 60,
+    "low_battery": True,
+    "low_percent": 20,
+    "dpi_alert": True,
+}
+
+
+def _normalize_config(data: dict) -> dict:
+    merged = dict(DEFAULT_CONFIG)
+    if isinstance(data, dict):
+        merged.update(data)
+    try:
+        interval = int(merged.get("interval", 60))
+    except (TypeError, ValueError):
+        interval = 60
+    try:
+        percent = int(merged.get("low_percent", 20))
+    except (TypeError, ValueError):
+        percent = 20
+    return {
+        "interval": min(1800, max(30, interval)),
+        "low_battery": bool(merged.get("low_battery", True)),
+        "low_percent": min(50, max(5, percent)),
+        "dpi_alert": bool(merged.get("dpi_alert", True)),
+    }
+
+
 def load_config() -> dict:
-    data = {"interval": 60}
+    data: dict = {}
     try:
         found = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if isinstance(found, dict):
-            data.update(found)
+            data = found
     except (OSError, json.JSONDecodeError):
         pass
-    try:
-        interval = int(data.get("interval", 60))
-    except (TypeError, ValueError):
-        interval = 60
-    data["interval"] = min(1800, max(30, interval))
-    return data
+    return _normalize_config(data)
 
 
 def save_config(data: dict) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"interval": int(data.get("interval", 60))}
+    payload = _normalize_config({**load_config(), **data})
     CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

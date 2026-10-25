@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import queue
 import sys
 import threading
 import time
 import traceback
 from ctypes import wintypes
 
+import alerts
 import delux_battery as battery
+import dpi_watch
+import devices
 import win_icon
 import win_setup as setup
 
@@ -30,6 +34,9 @@ WM_RBUTTONUP = 0x0205
 WM_APP = 0x8000
 MSG_TRAY = WM_APP + 1
 MSG_DONE = WM_APP + 2
+MSG_NOTE = WM_APP + 3
+NIF_INFO = 0x10
+NIIF_INFO = 0x1
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
 WS_POPUP = 0x80000000
@@ -124,7 +131,9 @@ class Tray:
         self.busy = False
         self.added = False
         self.hicon = None
-        self.reading = battery.Reading(False, "多彩 M900 Mini Pro+", None, None, None, "正在读取…", "")
+        self.readings: list[battery.Reading] = []
+        self.ready = False
+        self.notes: queue.Queue[tuple[str, str]] = queue.Queue()
         self.interval = setup.load_config()["interval"]
         self.msg_quit = user32.RegisterWindowMessageW(setup.MSG_QUIT)
         self.msg_reload = user32.RegisterWindowMessageW(setup.MSG_RELOAD)
@@ -144,15 +153,28 @@ class Tray:
         return nid
 
     def _tip(self) -> str:
-        reading = self.reading
         stamp = time.strftime("%H:%M:%S")
-        if reading.ok and reading.level is not None:
+        if not self.ready:
+            return "正在读取…"
+        if not self.readings:
+            return f"没有已连接的设备\n{stamp}"
+        lines = []
+        for reading in self.readings:
             state = f"{reading.level}% 充电中" if reading.charging else f"{reading.level}%"
-            return f"{reading.name}：{state}（{stamp} 更新）"
-        return f"{reading.name}：{reading.detail}"
+            if reading.dpi:
+                state += f" · DPI {reading.dpi}"
+            lines.append(f"{reading.name} {state}")
+        lines.append(stamp)
+        return "\n".join(lines)
+
+    def _icon_level(self) -> int | None:
+        levels = [reading.level for reading in self.readings if reading.ok and reading.level is not None]
+        if not levels:
+            return None
+        return min(levels)
 
     def _show(self, action: int) -> None:
-        level = self.reading.level if self.reading.ok else None
+        level = self._icon_level()
         text = str(level) if level is not None else "--"
         icon = win_icon.make_hicon(text, battery.level_rgb(level))
         nid = self._nid()
@@ -181,6 +203,23 @@ class Tray:
             return
         self._show(NIM_MODIFY)
 
+    def show_balloon(self, title: str, text: str) -> None:
+        if not self.added or not self.hwnd:
+            return
+        nid = self._nid()
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO
+        nid.hIcon = self.hicon or 0
+        nid.szTip = self._tip()[:127]
+        nid.szInfoTitle = title[:63]
+        nid.szInfo = text[:255]
+        nid.dwInfoFlags = NIIF_INFO
+        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+    def post_note(self, title: str, text: str) -> None:
+        self.notes.put((title, text))
+        if self.hwnd and user32.IsWindow(self.hwnd):
+            user32.PostMessageW(self.hwnd, MSG_NOTE, 0, 0)
+
     def remove_icon(self) -> None:
         nid = self._nid()
         nid.uFlags = 0
@@ -195,11 +234,13 @@ class Tray:
         user32.SetTimer(self.hwnd, 1, int(self.interval) * 1000, None)
 
     def reload_config(self) -> None:
-        interval = setup.load_config()["interval"]
+        config = setup.load_config()
+        interval = config["interval"]
         if interval != self.interval:
             self.interval = interval
             self.log(f"间隔 {interval}s")
             self.apply_timer()
+        dpi_watch.configure(bool(config["dpi_alert"]))
 
     def refresh(self) -> None:
         if self.busy or not self.hwnd:
@@ -209,9 +250,11 @@ class Tray:
 
     def _worker(self, hwnd) -> None:
         try:
-            self.reading = battery.read_battery(self.log if self.debug else None)
+            found = devices.read_devices(self.log if self.debug else None)
+            self.readings = devices.connected(found)
+            self.ready = True
+            alerts.notify(self.readings)
         except Exception:
-            self.reading = battery.Reading(False, "多彩 M900 Mini Pro+", None, None, None, "读取失败", "")
             self.log(traceback.format_exc())
         if user32.IsWindow(hwnd):
             user32.PostMessageW(hwnd, MSG_DONE, 0, 0)
@@ -231,6 +274,7 @@ class Tray:
 
     def quit(self) -> None:
         self.log("退出")
+        dpi_watch.stop()
         self.remove_icon()
         if self.hwnd:
             user32.DestroyWindow(self.hwnd)
@@ -244,13 +288,21 @@ class Tray:
                 elif event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
                     self.refresh()
                 return 0
+            if msg == MSG_NOTE:
+                while True:
+                    try:
+                        title, text = self.notes.get_nowait()
+                    except queue.Empty:
+                        break
+                    self.show_balloon(title, text)
+                return 0
             if msg == MSG_DONE:
                 self.busy = False
-                self.log(battery.format_line(self.reading))
+                for reading in self.readings:
+                    self.log(battery.format_line(reading))
                 self.update_icon()
                 return 0
             if msg == WM_TIMER:
-                self.reload_config()
                 self.refresh()
                 return 0
             if msg == self.msg_quit:
@@ -289,6 +341,7 @@ class Tray:
             return 1
         setup.promote_tray_icon()
         self.add_icon()
+        dpi_watch.start()
         setup.promote_tray_icon()
         self.apply_timer()
         self.refresh()
