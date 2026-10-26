@@ -161,8 +161,10 @@ class Tray:
         lines = []
         for reading in self.readings:
             state = f"{reading.level}% 充电中" if reading.charging else f"{reading.level}%"
-            if reading.dpi:
-                state += f" · DPI {reading.dpi}"
+            if reading.dpi_value:
+                state += f" · {reading.dpi_value} DPI"
+            elif reading.dpi:
+                state += f" · DPI 第 {reading.dpi} 档"
             lines.append(f"{reading.name} {state}")
         lines.append(stamp)
         return "\n".join(lines)

@@ -17,7 +17,8 @@ Battery reply, indexes on the 17-byte Windows buffer (report id included):
 * ``[6]`` percent, ``[7]`` 1 while charging, ``[8:10]`` voltage in mV, big-endian
 
 A live reply was ``08 04 00 00 00 02 2D 00 0F 0A ... 01``: 45%, not charging,
-3850 mV. Only commands 1 (identity), 3 (link up) and 4 (battery) are sent.
+3850 mV. Commands used here are 1 (identity), 3 (link up), 4 (battery) and
+8 (read-only EEPROM, for the current DPI gear and its count).
 """
 
 from __future__ import annotations
@@ -106,14 +107,18 @@ def build_eeprom_frame(address: int = 0, length: int = 10) -> bytes:
     return bytes(frame)
 
 
+# Compx hub ``Tt`` map. CurrentDPI is a 0-based index. Each DPI slot is 4 bytes.
+EEPROM_CURRENT_DPI = 4
+EEPROM_DPI_VALUE = 12
+
+
 def query_dpi(io: HidIo, log=None, timeout: float = 0.7) -> int | None:
     """Current DPI gear, 1 through 8. None when the mouse does not answer.
 
-    The hub stores ``currentDpi`` as a 0-based index at payload offset 4
-    (Windows byte 10) and selects ``dpiList[currentDpi]``. Its checksum is
-    ``0x55 - index``. A status byte other than 0 is not a real reply.
+    The hub reads EEPROM address 4, length 2 (``Tt.CurrentDPI``). The index
+    is 0-based and the next byte is ``0x55 - index``. Gear 1 is the first slot.
     """
-    frame = build_eeprom_frame()
+    frame = build_eeprom_frame(EEPROM_CURRENT_DPI, 2)
     if log:
         log("TX dpi " + frame.hex())
     packet, _saw = _transact(io, frame, timeout, lambda _packet: True)
@@ -121,45 +126,64 @@ def query_dpi(io: HidIo, log=None, timeout: float = 0.7) -> int | None:
         log("RX dpi " + (packet.hex() if packet else "none"))
     if packet is None or packet[2] != 0:
         return None
-    level = packet[10]
-    if not 0 <= level <= 7 or packet[11] != ((0x55 - level) & 0xFF):
+    level = packet[6]
+    if not 0 <= level <= 7 or packet[7] != ((0x55 - level) & 0xFF):
         return None
     return level + 1
 
 
 def _dpi_number(x_byte: int, y_byte: int, extra: int, sensor: str = "PAW3395") -> int | None:
-    """Hub decode for one X DPI slot.
+    """Hub decode for the X value of one DPI slot.
 
-    PAW3395 (this M900) uses ``ha()``: ``(x + 1) * 50``, doubled when bit 0 is set.
-    PAW3950Ultra uses ``la()``, which is a different scale.
+    Delux PAW3395 / PAW3950 follow ``Ki()``: ``(code + 1) * 50``, then doubled
+    for each low flag bit. The high gear (above 26000 on this M900) sets bit 0.
+    PAW3950Ultra is the ATK scale, not the Delux one.
     """
     x_code = x_byte | (((extra & 0x0C) >> 2) << 8)
     if sensor == "PAW3950Ultra":
         value = x_code * 50 + 10050 if extra & 0x02 else (x_code + 1) * 10
+        if extra & 0x01:
+            value *= 2
+        cap = 60000
     else:
         value = (x_code + 1) * 50
-    if extra & 0x01:
-        value *= 2
-    if 50 <= value <= 52000:
+        if extra & 0x01:
+            value *= 2
+        if extra & 0x02:
+            value *= 2
+        cap = 60000 if "3950" in sensor else 52000
+    if 50 <= value <= cap:
         return value
     return None
 
 
 def dpi_value_for(io: HidIo, gear: int, timeout: float = 0.04, sensor: str = "PAW3395") -> int | None:
-    """DPI count for a 1-based gear. Slots are stored in pairs from EEPROM 12."""
+    """DPI count for a 1-based gear. Slot ``n`` is 4 bytes at EEPROM ``12 + 4n``."""
     if not 1 <= gear <= 8:
         return None
-    pair = (gear - 1) // 2
-    slot = (gear - 1) % 2
-    frame = build_eeprom_frame(12 + pair * 8, 8)
+    frame = build_eeprom_frame(EEPROM_DPI_VALUE + (gear - 1) * 4, 4)
     packet, _saw = _transact(io, frame, timeout, lambda _packet: True)
-    if packet is None or packet[2] != 0 or len(packet) < 6 + slot * 4 + 4:
+    if packet is None or packet[2] != 0 or len(packet) < 10:
         return None
-    base = 6 + slot * 4
-    x_byte, y_byte, extra, crc = packet[base:base + 4]
+    x_byte, y_byte, extra, crc = packet[6:10]
     if crc != ((0x55 - ((x_byte + y_byte + extra) & 0xFF)) & 0xFF):
         return None
     return _dpi_number(x_byte, y_byte, extra, sensor)
+
+
+def sensor_for(cid: int | None, mid: int | None) -> str:
+    profile = PROFILES.get((cid, mid)) if cid is not None and mid is not None else None
+    if profile is None:
+        return "PAW3395"
+    return profile[1]
+
+
+def read_dpi(io: HidIo, log=None, timeout: float = 0.18, sensor: str = "PAW3395") -> tuple[int | None, int | None]:
+    """``(gear, dpi_count)`` while the mouse is already awake. Either may be missing."""
+    gear = query_dpi(io, log, timeout=timeout)
+    if not gear:
+        return None, None
+    return gear, dpi_value_for(io, gear, timeout=timeout, sensor=sensor)
 
 
 def peek_dpi_for(receivers: list[HidDevice], name: str, lock_name: str, timeout: float = 0.04) -> Reading | None:
@@ -176,12 +200,12 @@ def peek_dpi_for(receivers: list[HidDevice], name: str, lock_name: str, timeout:
     dev = receivers[0]
     try:
         with HidIo(dev.path, dev.input_len or REPORT_LEN) as io:
-            gear = query_dpi(io, timeout=timeout)
+            gear, value = read_dpi(io, timeout=timeout)
         if not gear:
             return None
         return Reading(
             True, name, None, None, None, "", f"2.4G · {dev.vid:04X}:{dev.pid:04X}",
-            dev.vid, dev.pid, None, None, gear,
+            dev.vid, dev.pid, None, None, gear, value,
         )
     except OSError:
         return None
@@ -320,10 +344,11 @@ def read_battery(debug=None) -> Reading:
                     cid = info[10] if info else None
                     mid = info[11] if info else None
                     name, _chips = _profile_name(cid, mid)
+                    gear, dpi_value = read_dpi(io, log, timeout=0.18, sensor=sensor_for(cid, mid))
                     detail = "充电中" if charging else "使用电池"
                     return Reading(
                         True, name, level, charging, None, detail, source,
-                        dev.vid, dev.pid, cid, mid,
+                        dev.vid, dev.pid, cid, mid, gear, dpi_value,
                     )
             except OSError as exc:
                 last = Reading(False, "多彩 M900 Mini Pro+", None, None, None, f"读取失败：{exc}", source, dev.vid, dev.pid)

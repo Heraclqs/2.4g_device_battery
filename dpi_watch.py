@@ -63,16 +63,37 @@ def _aula_query(io: HidIo, dev, name: str) -> Reading | None:
     )
 
 
+_delux_cache: dict[str, tuple[str, str]] = {}
+
+
+def _delux_identity(io: HidIo, dev, fallback: str) -> tuple[str, str]:
+    """Product name and sensor. Retries until the dongle answers identity."""
+    cached = _delux_cache.get(dev.path)
+    if cached:
+        return cached
+    frame = delux_battery.build_frame(
+        delux_battery.CMD_INFO, bytes([0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0])
+    )
+    packet, _saw = delux_battery._transact(io, frame, 0.12, lambda _packet: True)
+    if packet is None:
+        return fallback, "PAW3395"
+    name, _chips = delux_battery._profile_name(packet[10], packet[11])
+    sensor = delux_battery.sensor_for(packet[10], packet[11])
+    _delux_cache[dev.path] = (name, sensor)
+    return name, sensor
+
+
 def _compx_query(io: HidIo, dev, name: str) -> Reading | None:
-    gear = delux_battery.query_dpi(io, timeout=0.12)
+    if dev.vid == 0x3554:
+        name, sensor = _delux_identity(io, dev, name)
+    else:
+        sensor = "PAW3950Ultra"
+    try:
+        gear, value = delux_battery.read_dpi(io, timeout=0.12, sensor=sensor)
+    except OSError:
+        return None
     if not gear:
         return None
-    value = None
-    try:
-        sensor = "PAW3395" if dev.vid == 0x3554 else "PAW3950Ultra"
-        value = delux_battery.dpi_value_for(io, gear, timeout=0.12, sensor=sensor)
-    except OSError:
-        value = None
     return Reading(
         True, name, None, None, None, "", f"2.4G · {dev.vid:04X}:{dev.pid:04X}",
         dev.vid, dev.pid, dpi=gear, dpi_value=value,
@@ -276,9 +297,8 @@ def _owned(stop: threading.Event, popup, yield_to_tray: bool) -> None:
             now = time.monotonic()
             if now - last_scan > 1.0:
                 last_scan = now
-                listening = enabled()
-                specs = _specs() if listening else []
-                inphic = inphic_battery.find_receivers() if listening else []
+                specs = _specs()
+                inphic = inphic_battery.find_receivers()
                 paths = {dev.path for dev, _name, _query, _lock in specs}
                 paths.update(dev.path for dev in inphic)
                 for path in list(gears):
@@ -290,9 +310,7 @@ def _owned(stop: threading.Event, popup, yield_to_tray: bool) -> None:
                 for dev in inphic:
                     if dev.path not in gears:
                         gears[dev.path] = _Inphic(dev)
-            if not enabled():
-                stop.wait(SLOW)
-                continue
+            popup_now = popup if enabled() else None
             changed: list[Reading] = []
             awake = any(isinstance(item, _Inphic) for item in gears.values())
             busy = False
@@ -310,11 +328,15 @@ def _owned(stop: threading.Event, popup, yield_to_tray: bool) -> None:
                     if changed_gear:
                         alerts.note_dpi(
                             [reading],
-                            popup=popup,
+                            popup=popup_now,
                             announce=time.monotonic() >= gear.ready,
                         )
                     continue
-                if reading.dpi == gear.pending:
+                if gear.gear is None:
+                    gear.gear = reading.dpi
+                    gear.value = reading.dpi_value
+                    changed.append(reading)
+                elif reading.dpi == gear.pending:
                     gear.gear = reading.dpi
                     gear.value = reading.dpi_value
                     gear.pending = None
@@ -329,7 +351,7 @@ def _owned(stop: threading.Event, popup, yield_to_tray: bool) -> None:
                         gear.value = reading.dpi_value
                         changed.append(reading)
             if changed:
-                alerts.note_dpi(changed, popup=popup)
+                alerts.note_dpi(changed, popup=popup_now)
             stop.wait(FAST if awake or busy else SLOW)
     finally:
         for gear in gears.values():
