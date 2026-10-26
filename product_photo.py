@@ -1,7 +1,11 @@
-"""Load the product photos from the driver folders.
+"""Load the product photos for the home-page cards.
 
-Windows Imaging Component decodes the WebP files. The result is a small PNG
-with the black studio background removed, so it sits on the white card.
+On this machine the originals sit in the driver folders next to the repo.
+Windows Imaging Component decodes those WebP files, knocks out the black
+studio background, and returns a small PNG for the white card.
+
+assets/photos keeps a copy of that result. Another computer that only has
+the git repo still shows the real product, not the generic icon.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from delux_battery import Reading
 ROOT = Path(__file__).resolve().parent
 PARENT = ROOT.parent
 ASSETS = ROOT / "assets"
+PHOTOS = ASSETS / "photos"
 
 # (folder name piece, filename prefix, fit box)
 # F1, V75X and IN10R fill their frames, so a shared box makes them larger
@@ -307,13 +312,25 @@ def kind_for(reading: Reading) -> str:
     return "mouse"
 
 
+def _bundled_png(kind: str) -> bytes | None:
+    path = PHOTOS / f"{kind}.png"
+    if not path.is_file():
+        return None
+    key = ("bundled", str(path), path.stat().st_mtime_ns)
+    cached = _cache.get(key)
+    if cached is None:
+        cached = path.read_bytes()
+        _cache[key] = cached
+    return cached
+
+
 def png_for(reading: Reading) -> bytes | None:
     kind = kind_for(reading)
     if kind not in _SOURCES:
         return None
     path = source_for(kind)
     if path is None:
-        return None
+        return _bundled_png(kind)
     key = (str(path), path.stat().st_mtime_ns, _SOURCES[kind][2], kind in _MATCH_L3)
     cached = _cache.get(key)
     if cached is not None:
