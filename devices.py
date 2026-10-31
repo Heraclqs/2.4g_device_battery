@@ -9,9 +9,17 @@ import atk_mouse_battery
 import aula_battery
 import delux_battery
 import inphic_battery
+import vgn_keyboard_battery
 from delux_battery import Reading
 
-READERS = (delux_battery, aula_battery, inphic_battery, atk_mouse_battery, atk_keyboard_battery)
+READERS = (
+    delux_battery,
+    aula_battery,
+    inphic_battery,
+    atk_mouse_battery,
+    atk_keyboard_battery,
+    vgn_keyboard_battery,
+)
 
 
 def read_devices(debug=None) -> list[Reading]:

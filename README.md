@@ -2,7 +2,7 @@
 
 在 Windows 上读 2.4G 鼠标和键盘电量。不安装第三方包，只用 Python 标准库和 `ctypes`。
 
-已经接上的是多彩 M900 Mini Pro+、狼蛛 L3、英菲克（网页驱动里的 X3、IN10R 等型号）、ATK F1 和 ATK V75X。
+已经接上的是多彩 M900 Mini Pro+、狼蛛 L3、英菲克（网页驱动里的 X3、IN10R 等型号）、ATK F1、ATK V75X 和 VGN811。
 
 ## 运行
 
@@ -47,3 +47,7 @@ pythonw start_tray.pyw
 ## ATK V75X
 
 接收器是 `ATK V75X 2.4G Dongle`，`320F:5088`（有线是 `320F:5055`）。电量在 Usage Page `0xFF1C` / Usage `0x0092`，Report ID `0x04`，命令 `26`。百分比在载荷第 7 字节，下一字节为 `2` 表示正在充电。键盘休眠时命令字节回来是 `0xFF`，不会显示成 0%。报文写在 [PROTOCOL.md](PROTOCOL.md)。
+
+## VGN811
+
+接收器是 ROYUAN `2.4G Wireless Keyboard`，`3151:4011`（有线是 `3151:4010`）。电量在 Usage Page `0xFFFF` / Usage `0x0002` 的 65 字节 Feature Report 里，命令 `0x83`。百分比在载荷第 1 字节，下一字节为 `1` 表示正在充电。键盘休眠时这组接口会从系统里消失，主页不显示，也不会当成 0%。报文写在 [PROTOCOL.md](PROTOCOL.md)。

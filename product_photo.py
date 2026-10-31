@@ -33,8 +33,13 @@ _SOURCES = {
     "l3": ("狼蛛L3", "silver-", (210, 280)),
     "m900": ("多彩M900", "5d01", (210, 280)),
     "inphic": ("英菲克", "IN10R", (210, 280)),
+    "vgn811": ("VGN Driver", "yc500_vgn811", (520, 200)),
 }
-_MATCH_L3 = {"f1", "v75x", "inphic"}
+# Installed driver art, used when the folder is not beside this repo.
+_FIXED = {
+    "vgn811": Path(r"C:\VGN Driver\resources\app\company\company_VGN\dev\yc500_vgn811.png"),
+}
+_MATCH_L3 = {"f1", "v75x", "inphic", "vgn811"}
 
 _cache: dict[tuple, bytes] = {}
 
@@ -253,6 +258,36 @@ def _l3_span() -> int:
     return _l3_span_value
 
 
+def _crop_content(pixels: bytearray, width: int, height: int, pad: int = 2) -> tuple[int, int, bytearray]:
+    """Drop the transparent or white margin so a wide product fills the card."""
+    min_x, min_y, max_x, max_y = width, height, -1, -1
+    for y in range(height):
+        for x in range(width):
+            index = (y * width + x) * 4
+            blue, green, red, alpha = pixels[index:index + 4]
+            if alpha < 20 or (red > 248 and green > 248 and blue > 248):
+                continue
+            min_x = min(min_x, x)
+            min_y = min(min_y, y)
+            max_x = max(max_x, x)
+            max_y = max(max_y, y)
+    if max_x < 0:
+        return width, height, pixels
+    x0 = max(0, min_x - pad)
+    y0 = max(0, min_y - pad)
+    x1 = min(width, max_x + 1 + pad)
+    y1 = min(height, max_y + 1 + pad)
+    out_w = x1 - x0
+    out_h = y1 - y0
+    out = bytearray(out_w * out_h * 4)
+    row = out_w * 4
+    for y in range(out_h):
+        src = ((y + y0) * width + x0) * 4
+        dst = y * row
+        out[dst:dst + row] = pixels[src:src + row]
+    return out_w, out_h, out
+
+
 def _png(width: int, height: int, bgra: bytes) -> bytes:
     pixels = bytearray(bgra)
     _knock_out_black(pixels, width, height)
@@ -286,6 +321,9 @@ def _folder(piece: str) -> Path | None:
 
 
 def source_for(kind: str) -> Path | None:
+    fixed = _FIXED.get(kind)
+    if fixed is not None and fixed.is_file():
+        return fixed
     piece, prefix, _box = _SOURCES[kind]
     folder = _folder(piece)
     if folder is None:
@@ -307,6 +345,8 @@ def kind_for(reading: Reading) -> str:
         return "m900"
     if "英菲克" in reading.name or "INPHIC" in name or reading.vid == 0x1D57:
         return "inphic"
+    if "VGN" in name or reading.vid == 0x3151:
+        return "vgn811"
     if "键盘" in reading.name:
         return "keyboard"
     return "mouse"
@@ -341,6 +381,8 @@ def png_for(reading: Reading) -> bytes | None:
     _knock_out_black(pixels, width, height)
     if kind in _MATCH_L3:
         width, height, pixels = _scale_to(pixels, width, height, _l3_span())
+    if kind == "vgn811":
+        width, height, pixels = _crop_content(pixels, width, height)
     encoded = _png(width, height, pixels)
     _cache[key] = encoded
     return encoded
@@ -351,5 +393,5 @@ def fallback_path(reading: Reading) -> Path:
     path = ASSETS / f"{kind}.png"
     if path.exists():
         return path
-    generic = "keyboard.png" if kind in {"v75x", "keyboard"} else "mouse.png"
+    generic = "keyboard.png" if kind in {"v75x", "keyboard", "vgn811"} else "mouse.png"
     return ASSETS / generic
