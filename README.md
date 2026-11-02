@@ -50,4 +50,4 @@ pythonw start_tray.pyw
 
 ## VGN811
 
-接收器是 ROYUAN `2.4G Wireless Keyboard`，`3151:4011`（有线是 `3151:4010`）。电量在 Usage Page `0xFFFF` / Usage `0x0002` 的 65 字节 Feature Report 里，命令 `0x83`。百分比在载荷第 1 字节，下一字节为 `1` 表示正在充电。键盘休眠时这组接口会从系统里消失，主页不显示，也不会当成 0%。报文写在 [PROTOCOL.md](PROTOCOL.md)。
+接收器是 ROYUAN `2.4G Wireless Keyboard`，`3151:4011`（有线是 `3151:4010`）。电量在 Usage Page `0xFFFF` / Usage `0x0002` 的 65 字节 Feature Report 里。电脑开机后键盘停在 2.4G 时，电量从接收器本地命令 `0xF7` 读；键盘自己回 `0x83` 时也认。百分比在载荷第 1 字节。第 2 字节为 `1`，或插着数据线时第 3 字节为 `1`，表示正在充电。键盘休眠时这组接口会从系统里消失，主页不显示，也不会当成 0%。报文写在 [PROTOCOL.md](PROTOCOL.md)。

@@ -10,6 +10,7 @@ reply buffer is the following 64 bytes:
 * ``[0]`` changes between ``0x00`` and ``0x01`` while the keyboard is awake. It is not the command echo.
 * ``[1]`` percent, capped at 100
 * ``[2]`` ``0`` on battery, ``1`` while charging, any other value means full
+* ``[3]`` ``1`` while the cable is attached. On this keyboard that is the charging bit the 2.4G report actually flips; ``[2]`` stays ``0``.
 
 Verified on the receiver plugged into this machine:
 
@@ -18,6 +19,12 @@ Verified on the receiver plugged into this machine:
 * collection usage page ``0xFFFF``, usage ``0x0002``, feature report 65
 * one feature read came back ``00 00 44 00 00 01 01 01 79 ...`` (68%)
 * a later read came back ``00 01 45 00 00 01 01 01 79 ...`` (69%)
+
+After the PC boots with the keyboard in 2.4G, command ``0x83`` does not
+come back: the feature buffer stays empty or holds the dongle id
+``AA 55``. The dongle answers ``0xF7`` locally. On this machine that
+snapshot was ``00 00 61 00 01 01 01 01 00`` (97%, charging). Byte 7 is ``0`` there,
+not ``0x79``.
 
 The keyboard interface disappears when the
 board sleeps, so a missing device is not shown as 0%.
@@ -53,21 +60,40 @@ kernel32.ReleaseMutex.argtypes = [ctypes.wintypes.HANDLE]
 kernel32.WaitForSingleObject.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD]
 
 
-def build_query() -> bytes:
+CMD_DONGLE = 0xF7
+
+
+def build_frame(cmd: int, checksum: str = "low7") -> bytes:
+    """Feature report. Byte 0 is report id ``0``.
+
+    ``low7`` is the keyboard command checksum (``sum & 0x7F``).
+    ``inv`` is the dongle-local checksum (``255 - (sum & 255)``), used by ``0xF7``.
+    """
     payload = bytearray(64)
-    payload[0] = CMD_BATTERY
-    payload[7] = sum(payload[:7]) & 0x7F
+    payload[0] = cmd
+    total = sum(payload[:7])
+    if checksum == "inv":
+        payload[7] = (255 - (total & 255)) & 255
+    else:
+        payload[7] = total & 0x7F
     frame = bytearray(FEATURE_LEN)
     frame[1:] = payload
     return bytes(frame)
 
 
-def _parse(packet: bytes | None):
+def build_query() -> bytes:
+    return build_frame(CMD_BATTERY, "low7")
+
+
+def _parse(packet: bytes | None, *, allow_dongle: bool = False):
     """Return ``(level, charging, full)`` or None."""
     if not packet or len(packet) < 4:
         return None
     payload = packet[1:] if packet[0] == 0 else packet
     if len(payload) < 8:
+        return None
+    # Sticky dongle-id report left behind by 0xFD. Not a battery.
+    if payload[0] == 0xAA and payload[1] == 0x55:
         return None
     level = payload[1]
     status = payload[2]
@@ -75,10 +101,15 @@ def _parse(packet: bytes | None):
         return None
     if level == 0 and status == 0 and not any(payload[1:8]):
         return None
-    # Awake keyboards keep this tail. A zeroed or unrelated report does not.
-    if payload[3:7] != b"\x00\x01\x01\x01":
+    # Awake marker. A keyboard echo also ends in 0x79. After a cold boot the
+    # dongle status snapshot keeps the marker and leaves byte 7 at 0.
+    if payload[4] != 0x01 or payload[6] != 0x01:
         return None
-    return level, status == 1, status not in (0, 1)
+    if not allow_dongle and payload[7] != 0x79:
+        return None
+    charging = status == 1 or payload[3] == 1
+    full = status not in (0, 1) and not charging
+    return level, charging, full
 
 
 def _exchange(handle, frame: bytes):
@@ -127,8 +158,11 @@ def read_battery(debug=None) -> Reading:
 
     def once() -> Reading:
         last = Reading(False, NAME, None, None, None, "没有回复，动一下键盘", "")
-        frame = build_query()
-        for dev in receivers:
+        # The cable interface answers with a different feature report. The
+        # dongle is the one that has the battery, including while charging.
+        radio = [dev for dev in receivers if dev.pid == 0x4011]
+        ordered = radio or receivers
+        for dev in ordered:
             link = "有线" if dev.pid == 0x4010 else "2.4G"
             source = f"{link} · {dev.vid:04X}:{dev.pid:04X} · {dev.product or NAME}"
             handle = _open(dev.path, GENERIC_READ | GENERIC_WRITE) or _open(dev.path, GENERIC_READ)
@@ -137,22 +171,29 @@ def read_battery(debug=None) -> Reading:
                 log("open failed")
                 continue
             try:
-                log("TX battery " + frame[:10].hex())
-                raw = _exchange(handle, frame)
-                log("RX battery " + (raw[:12].hex() if raw else "none"))
-                parsed = _parse(raw)
-                if parsed is None:
-                    last = Reading(False, NAME, None, None, None, "没有回复，动一下键盘", source, dev.vid, dev.pid)
-                    continue
-                level, charging, full = parsed
-                if charging:
-                    detail = "充电中"
-                elif full:
-                    detail = "已充满"
-                else:
-                    detail = "使用电池"
-                log(f"RX battery {level} charge {int(charging)} full {int(full)}")
-                return Reading(True, NAME, level, charging, None, detail, source, dev.vid, dev.pid)
+                queries = [(build_query(), False)]
+                if dev.pid == 0x4011:
+                    queries.insert(0, (build_frame(CMD_DONGLE, "inv"), True))
+                for frame, allow_dongle in queries:
+                    log("TX battery " + frame[:10].hex())
+                    raw = _exchange(handle, frame)
+                    parsed = _parse(raw, allow_dongle=allow_dongle)
+                    if parsed is None and allow_dongle:
+                        raw = _exchange(handle, frame)
+                        parsed = _parse(raw, allow_dongle=True)
+                    log("RX battery " + (raw[:12].hex() if raw else "none"))
+                    if parsed is None:
+                        continue
+                    level, charging, full = parsed
+                    if charging:
+                        detail = "充电中"
+                    elif full:
+                        detail = "已充满"
+                    else:
+                        detail = "使用电池"
+                    log(f"RX battery {level} charge {int(charging)} full {int(full)}")
+                    return Reading(True, NAME, level, charging, None, detail, source, dev.vid, dev.pid)
+                last = Reading(False, NAME, None, None, None, "没有回复，动一下键盘", source, dev.vid, dev.pid)
             finally:
                 kernel32.CloseHandle(handle)
         return last
