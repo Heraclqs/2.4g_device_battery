@@ -543,7 +543,7 @@ class Panel:
         self._dpi_labels[self._dpi_key(reading)] = (card["meta"], base)
 
     def _dpi_key(self, reading: battery.Reading) -> str:
-        return f"{reading.vid:04X}:{reading.pid:04X}"
+        return battery.link_key(reading)
 
     def _restore_dpi(self, reading: battery.Reading) -> None:
         """A battery refresh does not carry DPI. Keep the last gear on the card."""
@@ -634,7 +634,7 @@ class Panel:
             return
         changed = False
         for reading in self.online:
-            info = found.get(f"{reading.vid:04X}:{reading.pid:04X}")
+            info = found.get(battery.link_key(reading))
             if not isinstance(info, dict):
                 continue
             gear = info.get("gear")

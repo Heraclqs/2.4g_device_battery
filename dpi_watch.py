@@ -257,10 +257,11 @@ class _Gear:
             self.mutex = None
 
     def poll(self) -> Reading | None:
-        if not self.mutex:
+        mutex = self.mutex
+        if not mutex:
             return None
         self.busy = False
-        waited = kernel32.WaitForSingleObject(self.mutex, 0)
+        waited = kernel32.WaitForSingleObject(mutex, 0)
         if waited not in (0, 0x80):
             self.busy = True
             return None
@@ -269,15 +270,20 @@ class _Gear:
                 self.io = HidIo(self.dev.path, self.dev.input_len or 64)
             return self.query(self.io, self.dev, self.name)
         except OSError:
-            self.close()
+            # Release the mutex before dropping its handle. Closing an owned
+            # mutex leaves this thread holding it, and later battery reads wait
+            # until they give up.
+            if self.io is not None:
+                self.io.close()
+                self.io = None
             return None
         finally:
-            kernel32.ReleaseMutex(self.mutex)
+            kernel32.ReleaseMutex(mutex)
 
 
 def _specs() -> list[tuple]:
     found = []
-    for dev in aula_battery.find_receivers():
+    for dev in aula_battery.active_receivers():
         found.append((dev, "狼蛛 L3", _aula_query, aula_battery.HID_LOCK))
     for dev in atk_mouse_battery.find_receivers():
         found.append((dev, "ATK F1", _compx_query, atk_mouse_battery.HID_LOCK))

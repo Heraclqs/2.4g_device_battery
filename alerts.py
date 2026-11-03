@@ -14,7 +14,7 @@ import threading
 import time
 
 import win_setup as setup
-from delux_battery import Reading
+from delux_battery import Reading, link_key
 
 STATE_PATH = setup.APP_DIR / "alert_state.json"
 LIVE_PATH = setup.APP_DIR / "dpi_live.json"
@@ -30,11 +30,11 @@ kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
 
 
 def _key(reading: Reading) -> str:
-    return f"{reading.vid:04X}:{reading.pid:04X}:{reading.name}"
+    return f"{link_key(reading)}:{reading.name}"
 
 
 def _dpi_key(reading: Reading) -> str:
-    return f"{reading.vid:04X}:{reading.pid:04X}"
+    return link_key(reading)
 
 
 def _load_state() -> dict:

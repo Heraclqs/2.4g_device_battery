@@ -39,6 +39,11 @@ HEADER = 8
 # Hub catalog: L3 wired mouse and its 2.4G receiver share PID 0x2255.
 PIDS = {0x2255}
 VIDS = {0xA8A4, 0xA8A5}
+WIRED_VID = 0xA8A4
+RADIO_VID = 0xA8A5
+# After the cable drops, the mouse may take a moment to answer on the dongle.
+# Keep the last percent through that gap instead of hiding the mouse.
+HOLD_AFTER_CABLE = 75.0
 USAGE_PAGE = 0xFF01
 USAGE = 0x0010
 
@@ -81,6 +86,15 @@ def find_receivers() -> list[HidDevice]:
         if dev.usage_page == USAGE_PAGE and dev.usage == USAGE and dev.output_len == WIRE_LEN:
             devices.append(dev)
     return devices
+
+
+def active_receivers(found: list[HidDevice] | None = None) -> list[HidDevice]:
+    """The cable and the dongle are one mouse. While the cable is in, use it."""
+    devices = find_receivers() if found is None else found
+    wired = [dev for dev in devices if dev.vid == WIRED_VID]
+    if wired:
+        return wired[:1]
+    return [dev for dev in devices if dev.vid == RADIO_VID][:1]
 
 
 def _locked(fn):
@@ -142,9 +156,10 @@ def _query_dpi(io: HidIo, log, timeout: float = 0.7) -> tuple[int | None, int | 
 
 def peek_dpi() -> Reading | None:
     """Short gear read for the live DPI watcher. None when the mouse is busy or asleep."""
-    receivers = find_receivers()
-    if not receivers:
+    chosen = active_receivers()
+    if not chosen:
         return None
+    dev = chosen[0]
     mutex = kernel32.CreateMutexW(None, False, HID_LOCK)
     if not mutex:
         return None
@@ -152,7 +167,6 @@ def peek_dpi() -> Reading | None:
     if waited not in (0, 0x80):
         kernel32.CloseHandle(mutex)
         return None
-    dev = receivers[0]
     try:
         with HidIo(dev.path, dev.input_len or WIRE_LEN) as io:
             gear, value = _query_dpi(io, None, timeout=0.04)
@@ -168,6 +182,30 @@ def peek_dpi() -> Reading | None:
     finally:
         kernel32.ReleaseMutex(mutex)
         kernel32.CloseHandle(mutex)
+
+
+_last_ok: Reading | None = None
+_wired_at = 0.0
+
+
+def _remember(reading: Reading) -> None:
+    global _last_ok, _wired_at
+    _last_ok = reading
+    if reading.vid == WIRED_VID:
+        _wired_at = time.monotonic()
+
+
+def _held(dev: HidDevice) -> Reading | None:
+    """Last percent, shown on the dongle, for a short time after the cable leaves."""
+    if _last_ok is None or _last_ok.level is None or _wired_at <= 0:
+        return None
+    if time.monotonic() - _wired_at > HOLD_AFTER_CABLE:
+        return None
+    source = f"2.4G · {dev.vid:04X}:{dev.pid:04X} · {dev.product or 'AULA L3'}"
+    return Reading(
+        True, "狼蛛 L3", _last_ok.level, False, None, "使用电池", source, dev.vid, dev.pid,
+        dpi=_last_ok.dpi, dpi_value=_last_ok.dpi_value,
+    )
 
 
 def _read_one(dev: HidDevice, debug) -> Reading:
@@ -216,11 +254,23 @@ def _read_one(dev: HidDevice, debug) -> Reading:
 
 
 def read_batteries(debug=None) -> list[Reading]:
-    receivers = find_receivers()
-    if not receivers:
+    chosen = active_receivers()
+    if not chosen:
         return []
+    dev = chosen[0]
 
     def once() -> list[Reading]:
-        return [_read_one(dev, debug) for dev in receivers]
+        return [_read_one(dev, debug)]
 
-    return _locked(once)
+    readings = _locked(once)
+    good = [item for item in readings if item.ok and item.level is not None]
+    if good:
+        _remember(good[0])
+        return good[:1]
+    # The dongle is still plugged in, but the mouse has not answered yet after
+    # the cable came out. Keep the card instead of hiding it.
+    if dev.vid == RADIO_VID:
+        held = _held(dev)
+        if held is not None:
+            return [held]
+    return readings

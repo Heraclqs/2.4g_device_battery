@@ -76,6 +76,17 @@ class Reading:
     dpi_value: int | None = None
 
 
+def link_key(reading: Reading) -> str:
+    """Identity shared by one physical device.
+
+    The L3 cable (``A8A4``) and its dongle (``A8A5``) are the same mouse.
+    Cards, DPI gear, and low-battery memory stay put when the cable moves.
+    """
+    if reading.pid == 0x2255 and reading.vid in (0xA8A4, 0xA8A5):
+        return "L3"
+    return f"{reading.vid:04X}:{reading.pid:04X}"
+
+
 def level_rgb(level: int | None) -> tuple[int, int, int]:
     if level is None:
         return (150, 155, 160)
