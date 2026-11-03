@@ -9,8 +9,11 @@ reply buffer is the following 64 bytes:
 
 * ``[0]`` changes between ``0x00`` and ``0x01`` while the keyboard is awake. It is not the command echo.
 * ``[1]`` percent, capped at 100
-* ``[2]`` ``0`` on battery, ``1`` while charging, any other value means full
-* ``[3]`` ``1`` while the cable is attached. On this keyboard that is the charging bit the 2.4G report actually flips; ``[2]`` stays ``0``.
+* ``[2]`` ``0`` on battery, ``1`` while charging, any other value means full.
+  The official driver uses only this byte.
+* ``[3]`` also becomes ``1`` after the backlight times out, while ``[2]`` stays ``0``.
+  A live idle report was ``00 00 5A 00 01 01 00 01 79`` (90%, not charging).
+  Cable charging is the wired interface ``4010`` being present, not this byte.
 
 Verified on the receiver plugged into this machine:
 
@@ -23,7 +26,7 @@ Verified on the receiver plugged into this machine:
 After the PC boots with the keyboard in 2.4G, command ``0x83`` does not
 come back: the feature buffer stays empty or holds the dongle id
 ``AA 55``. The dongle answers ``0xF7`` locally. On this machine that
-snapshot was ``00 00 61 00 01 01 01 01 00`` (97%, charging). Byte 7 is ``0`` there,
+snapshot was ``00 00 61 00 00 01 01 01 00`` (97%, on battery). Byte 7 is ``0`` there,
 not ``0x79``.
 
 The keyboard interface disappears when the
@@ -107,8 +110,10 @@ def _parse(packet: bytes | None, *, allow_dongle: bool = False):
         return None
     if not allow_dongle and payload[7] != 0x79:
         return None
-    charging = status == 1 or payload[3] == 1
-    full = status not in (0, 1) and not charging
+    # [3] == 1 also happens when the backlight has timed out and the cable is
+    # unplugged. The driver treats only [2] as the charge state.
+    charging = status == 1
+    full = status not in (0, 1)
     return level, charging, full
 
 
@@ -120,6 +125,11 @@ def _exchange(handle, frame: bytes):
     if not hid.HidD_GetFeature(handle, got, FEATURE_LEN):
         return None
     return bytes(got.raw)
+
+
+def cable_attached() -> bool:
+    """The keyboard enumerates ``3151:4010`` only while the USB cable is in."""
+    return any(dev.vid == VID and dev.pid == 0x4010 for dev in enumerate_hid())
 
 
 def find_receivers() -> list[HidDevice]:
@@ -185,6 +195,8 @@ def read_battery(debug=None) -> Reading:
                     if parsed is None:
                         continue
                     level, charging, full = parsed
+                    if not charging and not full and cable_attached():
+                        charging = True
                     if charging:
                         detail = "充电中"
                     elif full:
